@@ -11,6 +11,7 @@ dependencies = [
     "torch>=2.1.0",
     "psutil",
     "numpy",
+    "pyzmq>=25.0",
 ]
 
 [project.optional-dependencies]

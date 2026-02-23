@@ -16,7 +16,8 @@ def main():
     parser = argparse.ArgumentParser(description="CUDA IPC Inference Worker")
     parser.add_argument("--model", default="mlp", choices=["mlp", "resnet18"])
     parser.add_argument("--device", default=None, help="CUDA device (default: from config)")
-    parser.add_argument("--socket", default=None, help="UDS path (default: from config)")
+    parser.add_argument("--endpoint", default=None, help="ZMQ endpoint for single WM (default: from config)")
+    parser.add_argument("--endpoints", default=None, help="Comma-separated ZMQ endpoints for TP mode")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -28,8 +29,10 @@ def main():
     kwargs = {"model_name": args.model}
     if args.device:
         kwargs["device"] = args.device
-    if args.socket:
-        kwargs["socket_path"] = args.socket
+    if args.endpoints:
+        kwargs["endpoint"] = [ep.strip() for ep in args.endpoints.split(",")]
+    elif args.endpoint:
+        kwargs["endpoint"] = args.endpoint
 
     worker = InferenceWorker(**kwargs)
     worker.connect_and_load()

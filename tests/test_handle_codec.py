@@ -131,3 +131,78 @@ class TestEncodeDecodeRoundtrip:
         assert decoded["conv.weight"]["size"] == [64, 3, 7, 7]
         assert decoded["conv.weight"]["stride"] == [147, 49, 7, 1]
         assert decoded["conv.weight"]["storage_offset"] == 128
+
+
+class TestTPFormat:
+    """Tests for TP envelope format with rank metadata."""
+
+    def test_tp_roundtrip(self):
+        """Encode with tp_rank/tp_world_size, decode preserves them."""
+        handles = {
+            "fc1.weight": {
+                "metadata": _make_fake_metadata(),
+                "size": [128, 784],
+                "stride": [784, 1],
+                "dtype": torch.float32,
+                "storage_offset": 0,
+            },
+        }
+        encoded = encode_handles(handles, tp_rank=0, tp_world_size=2)
+        decoded = decode_handles(encoded)
+
+        assert decoded["tp_rank"] == 0
+        assert decoded["tp_world_size"] == 2
+        assert "handles" in decoded
+        assert "fc1.weight" in decoded["handles"]
+        assert decoded["handles"]["fc1.weight"]["size"] == [128, 784]
+        assert decoded["handles"]["fc1.weight"]["dtype"] is torch.float32
+
+    def test_tp_rank_1(self):
+        """Rank 1 encodes/decodes correctly."""
+        handles = {
+            "fc2.weight": {
+                "metadata": _make_fake_metadata(),
+                "size": [10, 128],
+                "stride": [128, 1],
+                "dtype": torch.float32,
+                "storage_offset": 0,
+            },
+        }
+        encoded = encode_handles(handles, tp_rank=1, tp_world_size=2)
+        decoded = decode_handles(encoded)
+
+        assert decoded["tp_rank"] == 1
+        assert decoded["tp_world_size"] == 2
+        assert "fc2.weight" in decoded["handles"]
+
+    def test_legacy_format_still_works(self):
+        """Encoding without tp_rank produces flat dict (backward compat)."""
+        handles = _make_handles_dict()
+        encoded = encode_handles(handles)
+        decoded = decode_handles(encoded)
+
+        # Should NOT have tp_rank key
+        assert "tp_rank" not in decoded
+        # Should have tensor names directly
+        assert "fc1.weight" in decoded
+
+    def test_tp_format_auto_detection(self):
+        """decode_handles auto-detects TP vs legacy format."""
+        handles = {"fc1.weight": {
+            "metadata": _make_fake_metadata(),
+            "size": [128, 784],
+            "stride": [784, 1],
+            "dtype": torch.float32,
+            "storage_offset": 0,
+        }}
+
+        # Legacy
+        legacy_encoded = encode_handles(handles)
+        legacy_decoded = decode_handles(legacy_encoded)
+        assert "tp_rank" not in legacy_decoded
+
+        # TP
+        tp_encoded = encode_handles(handles, tp_rank=0, tp_world_size=4)
+        tp_decoded = decode_handles(tp_encoded)
+        assert tp_decoded["tp_rank"] == 0
+        assert tp_decoded["tp_world_size"] == 4

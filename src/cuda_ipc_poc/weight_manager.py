@@ -4,7 +4,7 @@ Lifecycle:
   1. Set PYTORCH_CUDA_ALLOC_CONF to disable expandable_segments
   2. Load model to GPU, freeze parameters
   3. Export IPC handles for every parameter and buffer
-  4. Serve handles over Unix Domain Socket
+  4. Serve handles over ZMQ REP socket
   5. Periodically call ipc_collect() to reclaim memory from dead workers
 """
 
@@ -16,10 +16,11 @@ import time
 import torch
 import torch.nn as nn
 
-from .config import CUDA_ALLOC_CONF, DEVICE, IPC_COLLECT_INTERVAL, SOCKET_PATH
+from .config import CUDA_ALLOC_CONF, DEVICE, IPC_COLLECT_INTERVAL, ZMQ_ENDPOINT
 from .handle_codec import encode_handles
 from .ipc_channel import HandleServer
 from .model import get_model
+from .tensor_parallel import shard_model
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +30,9 @@ class WeightManager:
         self,
         model_name: str = "mlp",
         device: str = DEVICE,
-        socket_path: str = SOCKET_PATH,
+        endpoint: str = ZMQ_ENDPOINT,
+        tp_rank: int = 0,
+        tp_world_size: int = 1,
     ):
         # Must be set before any CUDA operation
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = CUDA_ALLOC_CONF
@@ -37,18 +40,20 @@ class WeightManager:
 
         self._model_name = model_name
         self._device = device
-        self._socket_path = socket_path
+        self._endpoint = endpoint
+        self._tp_rank = tp_rank
+        self._tp_world_size = tp_world_size
         self._model: nn.Module | None = None
         self._sample_input_fn = None
-        self._server = HandleServer(socket_path)
+        self._server = HandleServer(endpoint)
         self._running = True
 
     def load_model(self) -> None:
         """Load model to GPU and export IPC handles."""
         model, self._sample_input_fn = get_model(self._model_name)
-        # .eval() here is nn.Module.eval(), setting evaluation mode — not Python eval()
+        # nn.Module method that sets evaluation mode (disables dropout etc.)
         self._model = model.to(self._device)
-        self._model.eval()
+        self._model.eval()  # noqa: S307
         self._model.requires_grad_(False)
         log.info(
             "Model '%s' loaded to %s (%d parameters, %d buffers)",
@@ -58,10 +63,26 @@ class WeightManager:
             sum(1 for _ in self._model.buffers()),
         )
 
-        handles = self._export_handles()
-        encoded = encode_handles(handles)
+        if self._tp_world_size > 1:
+            # TP mode: shard model and export only this rank's shard
+            shard = shard_model(self._model, self._tp_world_size, self._tp_rank, self._device)
+            # Re-export IPC handles from the shard tensors (already on device)
+            handles = {}
+            for name, tensor in shard.items():
+                handles[name] = self._tensor_to_handle(tensor)
+            # Keep shard tensors alive by storing references
+            self._shard_tensors = shard
+            encoded = encode_handles(handles, tp_rank=self._tp_rank, tp_world_size=self._tp_world_size)
+            log.info(
+                "TP rank %d/%d: exported %d shard handles (%d bytes)",
+                self._tp_rank, self._tp_world_size, len(handles), len(encoded),
+            )
+        else:
+            handles = self._export_handles()
+            encoded = encode_handles(handles)
+            log.info("Exported %d tensor handles (%d bytes)", len(handles), len(encoded))
+
         self._server.set_handles(encoded)
-        log.info("Exported %d tensor handles (%d bytes)", len(handles), len(encoded))
 
     def _export_handles(self) -> dict:
         """Extract IPC handles for all parameters and buffers."""
@@ -92,7 +113,7 @@ class WeightManager:
     def serve(self) -> None:
         """Start serving handles and run ipc_collect loop until interrupted."""
         self._server.serve_in_background()
-        log.info("Weight Manager serving on %s", self._socket_path)
+        log.info("Weight Manager serving on %s", self._endpoint)
 
         # Graceful shutdown on SIGINT/SIGTERM
         def _shutdown(signum, frame):

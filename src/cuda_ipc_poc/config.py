@@ -5,7 +5,7 @@ All values can be overridden via environment variables.
 
 import os
 
-SOCKET_PATH = os.environ.get("CUDA_IPC_SOCKET", "/tmp/cuda_ipc_weight_manager.sock")
+ZMQ_ENDPOINT = os.environ.get("CUDA_IPC_ZMQ_ENDPOINT", "ipc:///tmp/cuda_ipc_wm.zmq")
 
 DEVICE = os.environ.get("CUDA_IPC_DEVICE", "cuda:0")
 
@@ -13,6 +13,8 @@ DEVICE = os.environ.get("CUDA_IPC_DEVICE", "cuda:0")
 # PyTorch 2.2+ may enable it by default, which uses cudaMemCreate/cudaMemMap
 # instead of cudaMalloc, breaking cudaIpcGetMemHandle.
 CUDA_ALLOC_CONF = "expandable_segments:False"
+
+TP_WORLD_SIZE = int(os.environ.get("CUDA_IPC_TP_WORLD_SIZE", "1"))
 
 # Interval (seconds) for calling torch.cuda.ipc_collect() in the Weight Manager.
 # This reclaims GPU memory from terminated worker processes.

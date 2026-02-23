@@ -8,18 +8,9 @@ SECURITY NOTE: pickle is used intentionally here. CUDA IPC handles are only
 valid between processes on the same physical machine with the same GPU, so
 the attack surface is limited to local processes that already share hardware.
 
-Handle dict structure per parameter:
-{
-    "fc1.weight": {
-        "metadata": (device, handle_bytes, size, offset, ref_handle, ref_offset,
-                     event_handle, event_sync),
-        "size": [256, 784],
-        "stride": [784, 1],
-        "dtype": "torch.float32",
-        "storage_offset": 0,
-    },
-    ...
-}
+Supports two formats:
+  - Flat dict (legacy single-GPU): {name: handle_info, ...}
+  - TP dict (multi-GPU): {"tp_rank": int, "tp_world_size": int, "handles": {name: handle_info, ...}}
 """
 
 import pickle  # noqa: S403 — intentional, trusted same-machine IPC only
@@ -56,36 +47,74 @@ def _str_to_dtype(s: str) -> torch.dtype:
         raise ValueError(f"Unknown dtype string: {s!r}")
 
 
-def encode_handles(handles_dict: dict) -> bytes:
+def _encode_single_handle(info: dict) -> dict:
+    """Convert a single handle info dict to serializable form."""
+    return {
+        "metadata": info["metadata"],
+        "size": list(info["size"]),
+        "stride": list(info["stride"]),
+        "dtype": _dtype_to_str(info["dtype"]),
+        "storage_offset": info["storage_offset"],
+    }
+
+
+def _decode_single_handle(info: dict) -> dict:
+    """Restore a single handle info dict from serialized form."""
+    return {
+        "metadata": info["metadata"],
+        "size": info["size"],
+        "stride": info["stride"],
+        "dtype": _str_to_dtype(info["dtype"]),
+        "storage_offset": info["storage_offset"],
+    }
+
+
+def encode_handles(handles_dict: dict, tp_rank: int | None = None, tp_world_size: int | None = None) -> bytes:
     """Serialize handle dict to bytes for socket transmission.
 
-    Converts torch.dtype objects to strings for safe serialization.
+    If tp_rank is provided, wraps in TP envelope format.
+    Pickle is used intentionally for trusted same-machine IPC (see module docstring).
     """
-    serializable = {}
-    for name, info in handles_dict.items():
-        serializable[name] = {
-            "metadata": info["metadata"],
-            "size": list(info["size"]),
-            "stride": list(info["stride"]),
-            "dtype": _dtype_to_str(info["dtype"]),
-            "storage_offset": info["storage_offset"],
+    serializable_handles = {
+        name: _encode_single_handle(info)
+        for name, info in handles_dict.items()
+    }
+
+    if tp_rank is not None:
+        payload = {
+            "tp_rank": tp_rank,
+            "tp_world_size": tp_world_size,
+            "handles": serializable_handles,
         }
-    return pickle.dumps(serializable, protocol=pickle.HIGHEST_PROTOCOL)  # noqa: S301
+    else:
+        payload = serializable_handles
+
+    return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)  # noqa: S301
 
 
 def decode_handles(data: bytes) -> dict:
     """Deserialize bytes back to handle dict.
 
-    Restores torch.dtype from string representation.
+    Auto-detects TP envelope format vs legacy flat format.
+    Returns the full dict (including tp_rank/tp_world_size if present).
+    Pickle is used intentionally for trusted same-machine IPC (see module docstring).
     """
-    raw = pickle.loads(data)  # noqa: S301 — trusted same-machine IPC
-    handles = {}
-    for name, info in raw.items():
-        handles[name] = {
-            "metadata": info["metadata"],
-            "size": info["size"],
-            "stride": info["stride"],
-            "dtype": _str_to_dtype(info["dtype"]),
-            "storage_offset": info["storage_offset"],
+    raw = pickle.loads(data)  # noqa: S301
+
+    # Detect TP format by presence of "tp_rank" key
+    if "tp_rank" in raw:
+        handles = {
+            name: _decode_single_handle(info)
+            for name, info in raw["handles"].items()
         }
-    return handles
+        return {
+            "tp_rank": raw["tp_rank"],
+            "tp_world_size": raw["tp_world_size"],
+            "handles": handles,
+        }
+
+    # Legacy flat format
+    return {
+        name: _decode_single_handle(info)
+        for name, info in raw.items()
+    }
