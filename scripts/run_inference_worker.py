@@ -10,11 +10,15 @@ import torch
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "src"))
 
 from cuda_ipc_poc.inference_worker import InferenceWorker
+from cuda_ipc_poc.model_spec import ModelRegistry
+
+# Ensure built-in models are registered
+import cuda_ipc_poc.model  # noqa: F401
 
 
 def main():
     parser = argparse.ArgumentParser(description="CUDA IPC Inference Worker")
-    parser.add_argument("--model", default="mlp", choices=["mlp", "resnet18"])
+    parser.add_argument("--model", default="mlp", help=f"Model name (available: {', '.join(ModelRegistry.list_models())})")
     parser.add_argument("--device", default=None, help="CUDA device (default: from config)")
     parser.add_argument("--endpoint", default=None, help="ZMQ endpoint for single WM (default: from config)")
     parser.add_argument("--endpoints", default=None, help="Comma-separated ZMQ endpoints for TP mode")

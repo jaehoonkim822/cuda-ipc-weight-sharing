@@ -1,7 +1,14 @@
-"""Test model definitions for CUDA IPC PoC."""
+"""Model definitions for CUDA IPC PoC.
+
+Defines built-in models (SimpleMLP, ResNet18) and registers them
+with the ModelRegistry so they can be looked up by name.
+"""
 
 import torch
 import torch.nn as nn
+
+from .model_spec import ModelRegistry, ModelSpec
+from .tp_handler import SimpleMlpTPHandler
 
 
 class SimpleMLP(nn.Module):
@@ -51,3 +58,25 @@ def get_model(name: str = "mlp") -> tuple[nn.Module, callable]:
         return resnet18(weights=None), _resnet_sample_input
 
     raise ValueError(f"Unknown model: {name!r}. Choose 'mlp' or 'resnet18'.")
+
+
+# --- Registry registrations ---
+
+ModelRegistry.register("mlp", ModelSpec(
+    model_cls=SimpleMLP,
+    model_factory=lambda: SimpleMLP(),
+    sample_input_fn=_mlp_sample_input,
+    tp_handler=SimpleMlpTPHandler(),
+))
+
+
+def _resnet18_factory():
+    from torchvision.models import resnet18
+    return resnet18(weights=None)
+
+
+ModelRegistry.register("resnet18", ModelSpec(
+    model_cls=type(None),  # resolved lazily via factory
+    model_factory=_resnet18_factory,
+    sample_input_fn=_resnet_sample_input,
+))

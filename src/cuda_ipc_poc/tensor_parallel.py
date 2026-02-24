@@ -23,6 +23,10 @@ def shard_model(
     """Return one rank's shard of the model weights.
 
     Each WM calls this with its own rank to get the tensors it will serve.
+
+    .. deprecated::
+        Use ``SimpleMlpTPHandler.process_state_dict()`` from ``tp_handler`` module instead.
+        This function is kept for backward compatibility with existing tests.
     """
     state = model.state_dict()
     shard = {}

@@ -19,8 +19,7 @@ import torch.nn as nn
 from .config import CUDA_ALLOC_CONF, DEVICE, IPC_COLLECT_INTERVAL, ZMQ_ENDPOINT
 from .handle_codec import encode_handles
 from .ipc_channel import HandleServer
-from .model import get_model
-from .tensor_parallel import shard_model
+from .model_spec import ModelRegistry
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +32,7 @@ class WeightManager:
         endpoint: str = ZMQ_ENDPOINT,
         tp_rank: int = 0,
         tp_world_size: int = 1,
+        model_path: str | None = None,
     ):
         # Must be set before any CUDA operation
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = CUDA_ALLOC_CONF
@@ -43,6 +43,7 @@ class WeightManager:
         self._endpoint = endpoint
         self._tp_rank = tp_rank
         self._tp_world_size = tp_world_size
+        self._model_path = model_path
         self._model: nn.Module | None = None
         self._sample_input_fn = None
         self._server = HandleServer(endpoint)
@@ -50,9 +51,21 @@ class WeightManager:
 
     def load_model(self) -> None:
         """Load model to GPU and export IPC handles."""
-        model, self._sample_input_fn = get_model(self._model_name)
-        # nn.Module method that sets evaluation mode (disables dropout etc.)
+        # Ensure model registrations are loaded
+        import cuda_ipc_poc.model  # noqa: F401
+
+        spec = ModelRegistry.get(self._model_name)
+        self._sample_input_fn = spec.sample_input_fn
+
+        if spec.weight_loader and self._model_path:
+            state_dict = spec.weight_loader.load(self._model_path, self._device)
+            model = spec.model_factory()
+            model.load_state_dict(state_dict)
+        else:
+            model = spec.model_factory()
+
         self._model = model.to(self._device)
+        # nn.Module method that sets evaluation mode (disables dropout etc.)
         self._model.eval()  # noqa: S307
         self._model.requires_grad_(False)
         log.info(
@@ -64,9 +77,17 @@ class WeightManager:
         )
 
         if self._tp_world_size > 1:
-            # TP mode: shard model and export only this rank's shard
-            shard = shard_model(self._model, self._tp_world_size, self._tp_rank, self._device)
-            # Re-export IPC handles from the shard tensors (already on device)
+            if spec.tp_handler is None:
+                raise ValueError(
+                    f"Model {self._model_name!r} does not support tensor parallelism "
+                    "(no tp_handler in ModelSpec)"
+                )
+            full_state = self._model.state_dict()
+            shard = spec.tp_handler.process_state_dict(
+                full_state, self._tp_world_size, self._tp_rank,
+            )
+            # Move shard tensors to device and ensure contiguity
+            shard = {k: v.to(self._device).contiguous() for k, v in shard.items()}
             handles = {}
             for name, tensor in shard.items():
                 handles[name] = self._tensor_to_handle(tensor)

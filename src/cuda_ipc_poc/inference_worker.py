@@ -19,12 +19,32 @@ import torch.nn as nn
 from .config import CUDA_ALLOC_CONF, DEVICE, ZMQ_ENDPOINT
 from .handle_codec import decode_handles
 from .ipc_channel import HandleClient
-from .model import get_model
+from .model_spec import ModelRegistry
 from .tensor_parallel import DistributedTPForward, TPSimpleMLP
 
 log = logging.getLogger(__name__)
 
 _BUFFER_PREFIX = "__buffer__"
+
+
+def _assign_sharded_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    """Directly assign tensors to model parameters, bypassing load_state_dict shape checks.
+
+    Required for TP-sharded weights where tensor shapes differ from the model shell's
+    original dimensions (e.g., q_proj [hidden/N, hidden] into a [hidden, hidden] shell).
+    This is the standard approach used by Megatron-LM/vLLM for the same reason.
+    """
+    for name, tensor in state_dict.items():
+        parts = name.split(".")
+        module = model
+        for part in parts[:-1]:
+            module = getattr(module, part)
+        attr_name = parts[-1]
+        existing = getattr(module, attr_name, None)
+        if isinstance(existing, nn.Parameter):
+            setattr(module, attr_name, nn.Parameter(tensor, requires_grad=False))
+        else:
+            setattr(module, attr_name, tensor)
 
 
 class InferenceWorker:
@@ -54,6 +74,11 @@ class InferenceWorker:
     def _endpoint(self) -> str:
         """Return the single endpoint (for backward compat with scripts)."""
         return self._endpoints[0]
+
+    def _get_spec(self):
+        """Resolve ModelSpec from registry (ensures model module is imported)."""
+        import cuda_ipc_poc.model  # noqa: F401
+        return ModelRegistry.get(self._model_name)
 
     def connect_and_load(self) -> None:
         """Fetch IPC handles from Weight Manager(s) and reconstruct model."""
@@ -86,15 +111,59 @@ class InferenceWorker:
             state_dict[key] = tensor
             log.debug("Reconstructed tensor '%s': shape=%s, dtype=%s", key, tensor.shape, tensor.dtype)
 
-        model, self._sample_input_fn = get_model(self._model_name)
+        spec = self._get_spec()
+        model = spec.model_factory()
         self._model = model.to(self._device)
         # nn.Module method that sets evaluation mode
         self._model.eval()  # noqa: S307
         self._model.load_state_dict(state_dict, strict=True, assign=True)
+        self._sample_input_fn = spec.sample_input_fn
         log.info("Model loaded with shared weights (zero-copy)")
 
     def _connect_tp(self, all_decoded: list[dict]) -> None:
-        """Multi-endpoint TP mode: collect shards from each WM and build TPSimpleMLP."""
+        """Multi-endpoint TP mode: collect shards from each WM."""
+        spec = self._get_spec()
+
+        if spec.tp_handler and spec.tp_handler.HAS_BUILTIN_TP_FORWARD:
+            self._connect_tp_builtin(all_decoded, spec)
+        else:
+            self._connect_tp_legacy(all_decoded)
+
+        self._sample_input_fn = spec.sample_input_fn
+
+    def _connect_tp_builtin(self, all_decoded: list[dict], spec) -> None:
+        """TP for models with built-in TP-aware forward (e.g. LLaMA-style).
+
+        Creates model shell and injects sharded state_dict via assign=True.
+        """
+        for decoded in all_decoded:
+            tp_rank = decoded["tp_rank"]
+            tp_world_size = decoded["tp_world_size"]
+            handles = decoded["handles"]
+
+            first_info = next(iter(handles.values()))
+            device_idx = first_info["metadata"][0]
+            device = f"cuda:{device_idx}"
+
+            torch.cuda.set_device(device)
+            torch.cuda._lazy_init()
+
+            state_dict = {}
+            for name, info in handles.items():
+                tensor = self._reconstruct_tensor(info, device)
+                state_dict[name] = tensor
+                log.debug("TP rank %d: reconstructed '%s': shape=%s", tp_rank, name, tensor.shape)
+
+            log.info("TP rank %d/%d: received %d shard handles", tp_rank, tp_world_size, len(handles))
+
+        model = spec.model_factory()
+        self._model = model.to(device)
+        self._model.eval()  # noqa: S307
+        _assign_sharded_state_dict(self._model, state_dict)
+        log.info("TP model (builtin forward) loaded with %d ranks", tp_world_size)
+
+    def _connect_tp_legacy(self, all_decoded: list[dict]) -> None:
+        """Legacy TP path using TPSimpleMLP wrapper (for models without built-in TP forward)."""
         rank_shards: dict[int, dict[str, torch.Tensor]] = {}
 
         for decoded in all_decoded:
@@ -102,13 +171,10 @@ class InferenceWorker:
             tp_world_size = decoded["tp_world_size"]
             handles = decoded["handles"]
 
-            # Determine the device for this rank's tensors from the IPC metadata
-            # IPC handle metadata[0] is the device index
             first_info = next(iter(handles.values()))
             device_idx = first_info["metadata"][0]
             device = f"cuda:{device_idx}"
 
-            # Initialize CUDA context on this device if needed
             torch.cuda.set_device(device)
             torch.cuda._lazy_init()
 
@@ -122,8 +188,7 @@ class InferenceWorker:
             log.info("TP rank %d/%d: received %d shard handles", tp_rank, tp_world_size, len(handles))
 
         self._model = TPSimpleMLP(rank_shards, tp_world_size)
-        _, self._sample_input_fn = get_model(self._model_name)
-        log.info("TP model built with %d ranks", tp_world_size)
+        log.info("TP model (legacy wrapper) built with %d ranks", tp_world_size)
 
     def _connect_distributed_tp(self, decoded: dict) -> None:
         """Distributed TP: single endpoint, torch.distributed NCCL collectives."""
@@ -152,7 +217,8 @@ class InferenceWorker:
             dist.init_process_group(backend="nccl")
 
         self._model = DistributedTPForward(shard, tp_rank, tp_world_size)
-        _, self._sample_input_fn = get_model(self._model_name)
+        spec = self._get_spec()
+        self._sample_input_fn = spec.sample_input_fn
         log.info("Distributed TP model built for rank %d/%d", tp_rank, tp_world_size)
 
     def _reconstruct_tensor(self, info: dict, device: str) -> torch.Tensor:
