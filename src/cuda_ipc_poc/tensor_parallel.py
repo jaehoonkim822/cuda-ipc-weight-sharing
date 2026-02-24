@@ -9,6 +9,7 @@ The Worker collects all shards and uses TPSimpleMLP for TP-aware forward.
 """
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -91,3 +92,60 @@ class TPSimpleMLP(nn.Module):
             result = result + self._rank_shards[0]["fc2.bias"]
 
         return result
+
+
+class DistributedTPForward(nn.Module):
+    """Distributed TP forward using torch.distributed collectives.
+
+    Each worker (rank) holds only its own shard and communicates via
+    NCCL all_gather / all_reduce instead of local loops.
+
+    Requires torch.distributed to be initialized before construction.
+    """
+
+    def __init__(
+        self,
+        shard: dict[str, torch.Tensor],
+        rank: int,
+        world_size: int,
+    ):
+        super().__init__()
+        self._rank = rank
+        self._world_size = world_size
+
+        self._fc1_weight = shard["fc1.weight"]
+        self._fc1_bias = shard["fc1.bias"]
+        self._fc2_weight = shard["fc2.weight"]
+
+        # fc2.bias exists only on rank 0's shard.
+        # Broadcast it so every rank can add it after all_reduce.
+        if "fc2.bias" in shard:
+            self._fc2_bias = shard["fc2.bias"].clone()
+        else:
+            self._fc2_bias = torch.zeros(
+                self._fc2_weight.shape[0],
+                dtype=self._fc2_weight.dtype,
+                device=self._fc2_weight.device,
+            )
+        dist.broadcast(self._fc2_bias, src=0)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Column-parallel fc1: each rank computes its slice of the hidden layer
+        local_fc1 = F.relu(F.linear(x, self._fc1_weight, self._fc1_bias))
+
+        # all_gather: collect all ranks' hidden slices → full hidden [batch, 256]
+        gathered = [torch.empty_like(local_fc1) for _ in range(self._world_size)]
+        dist.all_gather(gathered, local_fc1)
+        hidden = torch.cat(gathered, dim=-1)
+
+        # Row-parallel fc2: each rank multiplies its slice of hidden
+        chunk_size = self._fc2_weight.shape[1]
+        start = self._rank * chunk_size
+        hidden_slice = hidden[:, start : start + chunk_size]
+        local_fc2 = F.linear(hidden_slice, self._fc2_weight)
+
+        # all_reduce(SUM): combine partial fc2 outputs across ranks
+        dist.all_reduce(local_fc2, op=dist.ReduceOp.SUM)
+
+        return local_fc2 + self._fc2_bias

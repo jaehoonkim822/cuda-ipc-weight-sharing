@@ -159,6 +159,31 @@ def _worker_tp_infer(model_name, device, endpoints, seed, result_dict, worker_id
     worker.cleanup()
 
 
+def _worker_distributed_tp_infer(
+    model_name, device, endpoint, rank, world_size, master_addr, master_port,
+    seed, result_dict, worker_id,
+):
+    """Worker process for distributed TP: connects to one WM, uses NCCL collectives."""
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = CUDA_ALLOC_CONF
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    from cuda_ipc_poc.inference_worker import InferenceWorker
+
+    worker = InferenceWorker(model_name, device, endpoint, distributed_tp=True)
+    worker.connect_and_load()
+
+    torch.manual_seed(seed)
+    sample = worker._sample_input_fn(device)
+    output = worker.infer(sample)
+
+    result_dict[worker_id] = {
+        "output": output.cpu().tolist(),
+    }
+    worker.cleanup()
+
+
 class VerificationSuite:
     def __init__(self, model_name: str, device: str, endpoint: str):
         self._model_name = model_name
@@ -213,12 +238,17 @@ class VerificationSuite:
             ("6. Crash Recovery", self.test_crash_recovery),
         ]
 
-        # Test 7 requires 2+ GPUs
+        # Tests requiring multiple GPUs
         n_gpus = torch.cuda.device_count()
         if n_gpus >= 2:
             tests.append(("7. Tensor Parallelism", self.test_tensor_parallelism))
+            tests.append(("8. Distributed TP (2 ranks)", self.test_distributed_tp_2))
         else:
-            log.info("Skipping Test 7 (Tensor Parallelism): requires 2+ GPUs, found %d", n_gpus)
+            log.info("Skipping Tests 7-8 (TP): requires 2+ GPUs, found %d", n_gpus)
+        if n_gpus >= 4:
+            tests.append(("9. Distributed TP (4 ranks)", self.test_distributed_tp_4))
+        else:
+            log.info("Skipping Test 9 (Distributed TP4): requires 4+ GPUs, found %d", n_gpus)
 
         results = []
         for name, test_fn in tests:
@@ -571,6 +601,128 @@ class VerificationSuite:
                         p.wait()
             # Clear wm_process so _stop_weight_manager doesn't complain
             self._wm_process = None
+
+    def _run_distributed_tp_test(self, world_size: int, master_port: int) -> None:
+        """Common helper for distributed TP tests (Test 8 / Test 9)."""
+        self._stop_weight_manager()
+
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = CUDA_ALLOC_CONF
+        from cuda_ipc_poc.model import get_model
+
+        tp_endpoints = [
+            f"ipc:///tmp/cuda_ipc_dtp_wm_{r}.zmq" for r in range(world_size)
+        ]
+
+        # Reference output from single-GPU model
+        model_seed = 99
+        torch.manual_seed(model_seed)
+        model_ref, sample_fn = get_model(self._model_name)
+        model_ref = model_ref.to(self._device)
+        model_ref.eval()
+        model_ref.requires_grad_(False)
+
+        input_seed = 42
+        torch.manual_seed(input_seed)
+        sample = sample_fn(self._device)
+        with torch.no_grad():
+            ref_output = model_ref(sample)
+        print(f"  Reference output shape: {ref_output.shape}")
+
+        # Start world_size WM subprocesses
+        script = os.path.join(os.path.dirname(__file__), "run_weight_manager.py")
+        env = os.environ.copy()
+        env["PYTORCH_CUDA_ALLOC_CONF"] = CUDA_ALLOC_CONF
+        wm_procs = []
+        for rank in range(world_size):
+            p = subprocess.Popen(
+                [
+                    sys.executable, script,
+                    "--model", self._model_name,
+                    "--device", f"cuda:{rank}",
+                    "--endpoint", tp_endpoints[rank],
+                    "--tp-rank", str(rank),
+                    "--tp-world-size", str(world_size),
+                    "--seed", str(model_seed),
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            wm_procs.append(p)
+
+        time.sleep(3.0)
+        for r, p in enumerate(wm_procs):
+            if p.poll() is not None:
+                raise RuntimeError(f"WM rank {r} exited unexpectedly")
+        print(f"  Started {world_size} WM processes")
+
+        master_addr = "127.0.0.1"
+        try:
+            manager = multiprocessing.Manager()
+            result_dict = manager.dict()
+
+            # Launch one worker per rank
+            worker_procs = []
+            for rank in range(world_size):
+                p = multiprocessing.Process(
+                    target=_worker_distributed_tp_infer,
+                    args=(
+                        self._model_name, f"cuda:{rank}", tp_endpoints[rank],
+                        rank, world_size, master_addr, master_port,
+                        input_seed, result_dict, rank,
+                    ),
+                )
+                p.start()
+                worker_procs.append(p)
+
+            for p in worker_procs:
+                p.join(timeout=60)
+
+            for rank, p in enumerate(worker_procs):
+                if p.exitcode != 0:
+                    raise AssertionError(
+                        f"Distributed TP worker rank {rank} failed (exit code {p.exitcode})"
+                    )
+
+            # Verify rank 0 output matches reference
+            rank0_output = torch.tensor(result_dict[0]["output"])
+            ref_cpu = ref_output.cpu()
+            max_diff = (rank0_output - ref_cpu).abs().max().item()
+            print(f"  Rank 0 output shape: {rank0_output.shape}")
+            print(f"  Max diff vs reference: {max_diff:.2e}")
+
+            if not torch.allclose(rank0_output, ref_cpu, atol=1e-5):
+                raise AssertionError(
+                    f"Distributed TP output differs from reference! Max diff: {max_diff}"
+                )
+
+            # Verify all ranks produced identical output (all_reduce guarantees this)
+            for rank in range(1, world_size):
+                rank_output = torch.tensor(result_dict[rank]["output"])
+                if not torch.allclose(rank0_output, rank_output, atol=1e-6):
+                    diff = (rank0_output - rank_output).abs().max().item()
+                    raise AssertionError(
+                        f"Rank {rank} output differs from rank 0! Max diff: {diff}"
+                    )
+            print(f"  All {world_size} ranks produced identical output")
+        finally:
+            for p in wm_procs:
+                if p.poll() is None:
+                    p.send_signal(signal.SIGTERM)
+                    try:
+                        p.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait()
+            self._wm_process = None
+
+    def test_distributed_tp_2(self) -> None:
+        """Test 8: Distributed TP with 2 WMs + 2 Workers + NCCL."""
+        self._run_distributed_tp_test(world_size=2, master_port=29501)
+
+    def test_distributed_tp_4(self) -> None:
+        """Test 9: Distributed TP with 4 WMs + 4 Workers + NCCL."""
+        self._run_distributed_tp_test(world_size=4, master_port=29502)
 
 
 def main():

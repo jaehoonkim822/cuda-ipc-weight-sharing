@@ -13,13 +13,14 @@ import logging
 import os
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from .config import CUDA_ALLOC_CONF, DEVICE, ZMQ_ENDPOINT
 from .handle_codec import decode_handles
 from .ipc_channel import HandleClient
 from .model import get_model
-from .tensor_parallel import TPSimpleMLP
+from .tensor_parallel import DistributedTPForward, TPSimpleMLP
 
 log = logging.getLogger(__name__)
 
@@ -32,11 +33,13 @@ class InferenceWorker:
         model_name: str = "mlp",
         device: str = DEVICE,
         endpoint: str | list[str] = ZMQ_ENDPOINT,
+        distributed_tp: bool = False,
     ):
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = CUDA_ALLOC_CONF
 
         self._model_name = model_name
         self._device = device
+        self._distributed_tp = distributed_tp
         # Normalize to list for uniform handling
         if isinstance(endpoint, str):
             self._endpoints = [endpoint]
@@ -65,8 +68,9 @@ class InferenceWorker:
             decoded = decode_handles(raw)
             all_decoded.append(decoded)
 
-        # Check if this is TP mode (first decoded has "tp_rank" key)
-        if len(all_decoded) > 1 or "tp_rank" in all_decoded[0]:
+        if self._distributed_tp:
+            self._connect_distributed_tp(all_decoded[0])
+        elif len(all_decoded) > 1 or "tp_rank" in all_decoded[0]:
             self._connect_tp(all_decoded)
         else:
             self._connect_single(all_decoded[0])
@@ -121,6 +125,36 @@ class InferenceWorker:
         _, self._sample_input_fn = get_model(self._model_name)
         log.info("TP model built with %d ranks", tp_world_size)
 
+    def _connect_distributed_tp(self, decoded: dict) -> None:
+        """Distributed TP: single endpoint, torch.distributed NCCL collectives."""
+        tp_rank = decoded["tp_rank"]
+        tp_world_size = decoded["tp_world_size"]
+        handles = decoded["handles"]
+
+        first_info = next(iter(handles.values()))
+        device_idx = first_info["metadata"][0]
+        device = f"cuda:{device_idx}"
+
+        torch.cuda.set_device(device)
+        torch.cuda._lazy_init()
+
+        shard = {}
+        for name, info in handles.items():
+            tensor = self._reconstruct_tensor(info, device)
+            shard[name] = tensor
+            log.debug("Distributed TP rank %d: reconstructed '%s': shape=%s", tp_rank, name, tensor.shape)
+
+        log.info("Distributed TP rank %d/%d: received %d shard handles", tp_rank, tp_world_size, len(handles))
+
+        # Initialize process group (env vars MASTER_ADDR, MASTER_PORT, RANK,
+        # WORLD_SIZE must be set by the caller before this point).
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+
+        self._model = DistributedTPForward(shard, tp_rank, tp_world_size)
+        _, self._sample_input_fn = get_model(self._model_name)
+        log.info("Distributed TP model built for rank %d/%d", tp_rank, tp_world_size)
+
     def _reconstruct_tensor(self, info: dict, device: str) -> torch.Tensor:
         """Reconstruct a tensor from IPC handle metadata."""
         metadata = info["metadata"]
@@ -154,5 +188,7 @@ class InferenceWorker:
         """Release all references to shared GPU memory."""
         self._model = None
         self._shared_storages.clear()
+        if dist.is_initialized():
+            dist.destroy_process_group()
         torch.cuda.empty_cache()
         log.info("Worker cleaned up shared references")

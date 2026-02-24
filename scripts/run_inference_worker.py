@@ -18,6 +18,11 @@ def main():
     parser.add_argument("--device", default=None, help="CUDA device (default: from config)")
     parser.add_argument("--endpoint", default=None, help="ZMQ endpoint for single WM (default: from config)")
     parser.add_argument("--endpoints", default=None, help="Comma-separated ZMQ endpoints for TP mode")
+    parser.add_argument("--distributed-tp", action="store_true", help="Enable distributed TP mode (1:1 WM-Worker)")
+    parser.add_argument("--tp-rank", type=int, default=0, help="This worker's TP rank")
+    parser.add_argument("--tp-world-size", type=int, default=1, help="Total number of TP ranks")
+    parser.add_argument("--master-addr", default="127.0.0.1", help="NCCL master address")
+    parser.add_argument("--master-port", default="29500", help="NCCL master port")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -33,6 +38,14 @@ def main():
         kwargs["endpoint"] = [ep.strip() for ep in args.endpoints.split(",")]
     elif args.endpoint:
         kwargs["endpoint"] = args.endpoint
+
+    if args.distributed_tp:
+        import os
+        os.environ.setdefault("MASTER_ADDR", args.master_addr)
+        os.environ.setdefault("MASTER_PORT", args.master_port)
+        os.environ["RANK"] = str(args.tp_rank)
+        os.environ["WORLD_SIZE"] = str(args.tp_world_size)
+        kwargs["distributed_tp"] = True
 
     worker = InferenceWorker(**kwargs)
     worker.connect_and_load()

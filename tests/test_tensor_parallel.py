@@ -1,5 +1,7 @@
 """Unit tests for tensor_parallel — CPU only, no GPU required."""
 
+import multiprocessing
+import os
 import pytest
 import torch
 
@@ -9,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from cuda_ipc_poc.model import SimpleMLP
-from cuda_ipc_poc.tensor_parallel import TPSimpleMLP, shard_model
+from cuda_ipc_poc.tensor_parallel import DistributedTPForward, TPSimpleMLP, shard_model
 
 
 @pytest.fixture
@@ -151,3 +153,102 @@ class TestTPSimpleMLP:
             assert torch.allclose(ref_out, tp_out, atol=1e-5), (
                 f"Batch {batch_size} max diff: {(ref_out - tp_out).abs().max().item()}"
             )
+
+
+# -- Distributed TP tests (gloo backend, CPU only) --
+
+def _distributed_tp_worker(rank, world_size, state_dict_bytes, input_bytes, master_port, result_dict):
+    """Entry point for each gloo process testing DistributedTPForward."""
+    import torch.distributed as dist
+    from cuda_ipc_poc.tensor_parallel import DistributedTPForward, shard_model
+    from cuda_ipc_poc.model import SimpleMLP
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    dist.init_process_group(backend="gloo")
+
+    try:
+        # Reconstruct model from state_dict to build shards
+        model = SimpleMLP()
+        model.load_state_dict(torch.load(
+            __import__("io").BytesIO(state_dict_bytes), weights_only=True,
+        ))
+        shard = shard_model(model, world_size, rank)
+
+        tp_fwd = DistributedTPForward(shard, rank, world_size)
+        x = torch.load(__import__("io").BytesIO(input_bytes), weights_only=True)
+        output = tp_fwd(x)
+
+        result_dict[rank] = output.tolist()
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_distributed_tp_test(world_size, master_port):
+    """Spawn gloo processes and compare against reference SimpleMLP output."""
+    torch.manual_seed(0)
+    model = SimpleMLP()
+    model.eval()
+
+    torch.manual_seed(42)
+    x = torch.randn(4, 784)
+
+    with torch.no_grad():
+        ref_output = model(x)
+
+    # Serialize model state and input for transfer to child processes
+    import io
+    state_buf = io.BytesIO()
+    torch.save(model.state_dict(), state_buf)
+    state_bytes = state_buf.getvalue()
+
+    input_buf = io.BytesIO()
+    torch.save(x, input_buf)
+    input_bytes = input_buf.getvalue()
+
+    ctx = multiprocessing.get_context("spawn")
+    manager = ctx.Manager()
+    result_dict = manager.dict()
+
+    procs = []
+    for rank in range(world_size):
+        p = ctx.Process(
+            target=_distributed_tp_worker,
+            args=(rank, world_size, state_bytes, input_bytes, master_port, result_dict),
+        )
+        p.start()
+        procs.append(p)
+
+    for p in procs:
+        p.join(timeout=30)
+
+    for rank, p in enumerate(procs):
+        assert p.exitcode == 0, f"Rank {rank} exited with code {p.exitcode}"
+
+    # Verify all ranks match reference
+    for rank in range(world_size):
+        rank_output = torch.tensor(result_dict[rank])
+        assert torch.allclose(ref_output, rank_output, atol=1e-5), (
+            f"Rank {rank} max diff: {(ref_output - rank_output).abs().max().item()}"
+        )
+
+    # Verify all ranks are identical (all_reduce guarantees this)
+    rank0_output = torch.tensor(result_dict[0])
+    for rank in range(1, world_size):
+        rank_output = torch.tensor(result_dict[rank])
+        assert torch.allclose(rank0_output, rank_output, atol=1e-6), (
+            f"Rank 0 vs {rank} diff: {(rank0_output - rank_output).abs().max().item()}"
+        )
+
+
+class TestDistributedTPForward:
+    def test_distributed_tp_world_size_2(self):
+        """DistributedTPForward with gloo backend, world_size=2."""
+        _run_distributed_tp_test(world_size=2, master_port=29601)
+
+    def test_distributed_tp_world_size_4(self):
+        """DistributedTPForward with gloo backend, world_size=4."""
+        _run_distributed_tp_test(world_size=4, master_port=29602)
